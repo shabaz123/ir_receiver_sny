@@ -1,0 +1,120 @@
+;
+; PIO code for receiving IR frames in the 'SNY' protocol
+; rev 1 - shabaz - oct 2023
+; License: BSD-3-Clause
+
+.program sny_ir_rx
+
+; Decode IR frames in sny format
+; The input pin should be connected to an IR detector with an 'active low' output.
+;
+; This program expects there to be 16 state machine clock ticks per 600 usec "unit" used in the protocol,
+; i.e. a clock tick evert 37.5 usec.
+;
+; The start burst lasts for approx 2.4 msec, and then there are fixed width positive pulses of 600 usec,
+; followed by a 600 usec negative pulse for a binary '0' or a 1200 usec negative pulse for a binary '1'
+; There are 20 binary values transferred.
+; To see if a button is held down or is a fresh press, we can see if the idle period is long or short
+; The LONG_IDLE value is used for a loop of time LONG_IDLE * 4.8 msec (2 * 2 * 32 * 37.5 usec = 4.8 msec)
+; So, a LONG_IDLE value of 31 means 149 msec.
+.define LONG_IDLE 31
+; For the start burst, we can wait for 54 clock cycles (each is 37.5 usec), i.e. 2 msec,
+; which is more than enough to detect the start of the burst while not too short to be confused
+; with a data bit. Since there are 2 clock cycles in the burst loop, then we need the
+; counter to be 27.
+.define BURST_LOOP_COUNTER 27                   ; the detection threshold for a 'frame sync' burst
+                                                ; an entire bit consists of two or three 600 usec periods (units)
+.define BIT_WIDTH_UNIT 16                       ; this is 600 usec
+.define BIT_WIDTH_HALF_UNIT 8                   ; this is 300 usec
+.define NUM_BITS 19                             ; the number of bits in the sny protocol, minus 1
+
+.wrap_target
+
+idle_start:
+    mov ISR, NULL                               ; reset the Input Shift Register
+                                                ; first, determine if the idle length is long, to distinguish
+                                                ; if a button is held down or is a new button press
+    set Y, LONG_IDLE                            ; to determine the idle length, set the outer loop counter
+outer_long_idle_loop:
+    set X, 31                                   ; set the inner loop counter to 31 (max value)
+inner_long_idle_loop:
+    jmp pin still_idle_loop                     ; pin is still high, so we are still in idle state
+    set X, 0                                    ; the pin has gone low. set the idle value to 0
+    jmp possible_burst_started
+
+still_idle_loop:
+    jmp X-- inner_long_idle_loop                ; loop until the timer expired
+    jmp Y-- outer_long_idle_loop
+                                                ; ok if we are here then the idle state is long, and
+                                                ; the start burst has not even begun.
+long_idle:
+    set X, 1                                    ; set the idle value to 1
+    wait 0 pin 0                                ; wait for IDLE->START_BURST to occur (i.e. logic low)
+                                                ; ok, the pin has gone low so it is believed a burst is starting
+
+possible_burst_started:
+    in X, 1                                     ; put the idle delay indication into the Input Shift Register
+    set X, BURST_LOOP_COUNTER
+
+burst_test:
+    jmp pin idle_start                          ; if the START_BURST ends too soon, go back to the beginning
+    jmp X-- burst_test                          ; loop until the timer expires
+burst_confirmed:
+                                                ; ok the burst is long enough, so now wait for the end of the burst
+    set Y, NUM_BITS                             ; 20 bits in the sny protocol
+    wait 1 pin 0                                ; wait for the sync burst to finish, i.e. wait for the pin to go high
+
+bit_start:
+    nop [ BIT_WIDTH_UNIT - 1 ]                  ; wait for the bit's high period to complete
+bit_start_subsequent:
+    nop [ BIT_WIDTH_HALF_UNIT - 2 ]             ; wait for window to start making the bit determination
+    set X, BIT_WIDTH_HALF_UNIT                  ; the window will be 600 usec but set X to half of that because
+                                                ; two clock cycles are used per loop, so we need to divide by 2
+bit_wait_to_sample:
+    jmp pin bit_value_0                         ; if the pin becomes high during the window, then the bit is determined
+                                                ; to be of value 0
+    jmp X-- bit_wait_to_sample                  ; loop until the window expires
+                                                ; the window has expired. The bit must be of value 1
+bit_value_1:
+    set X,1                                     ; set the bit value to 1
+    in X, 1                                     ; put the bit value into the ISR
+    wait 1 pin 0                                ; wait for the next bit to start
+    nop [ BIT_WIDTH_UNIT - 3 ]                  ; wait for the bit's high period to complete
+    jmp ready_for_next_bit
+
+bit_value_0:
+    set X, 0                                    ; set the bit value to 0
+    in X, 1                                     ; put the bit value into the Input Shift Register
+    nop [ BIT_WIDTH_UNIT - 4 ]                  ; wait for the bit's high period to complete
+ready_for_next_bit:
+    jmp Y-- bit_start_subsequent                ; now read in the next bit!
+    jmp idle_start                              ; Y is zero, so 20 bits have complete; we are done!
+
+.wrap
+
+
+% c-sdk {
+static inline void sny_ir_rx_program_init (PIO pio, uint sm, uint offset, uint pin) {
+    pio_gpio_init(pio, pin); // Set the GPIO function of the pin (connect the PIO to the pad)
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false); // Set the pin direction to `input` at the PIO
+    pio_sm_config c = sny_ir_rx_program_get_default_config (offset); // Create a new state machine configuration
+    // configure the Input Shift Register:
+    sm_config_set_in_shift (&c,
+                            true,       // shift right
+                            true,       // enable autopush
+                            21);        // autopush after 21 bits (idle length indicator bit, plus 20 data bits)
+
+
+    sm_config_set_fifo_join (&c, PIO_FIFO_JOIN_RX); // configure the FIFOs; join them to make a single large rx FIFO
+    sm_config_set_in_pins (&c, pin); // Map the IN pin group to the `pin` parameter of this function
+    sm_config_set_jmp_pin (&c, pin); // Map the JMP pin to the `pin` parameter of this function
+    // Set the clock divider to 16 ticks per 600 us burst period:
+    float div = clock_get_hz (clk_sys) / (16.0 / 600.0e-6);
+    sm_config_set_clkdiv (&c, div);
+
+    // Apply the configuration to the state machine:
+    pio_sm_init (pio, sm, offset, &c);
+
+    pio_sm_set_enabled (pio, sm, true); // run the state machine!
+}
+%}
